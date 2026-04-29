@@ -1,0 +1,10 @@
+# Used when building the agent image from the repo root:
+#   docker build -f agent/Dockerfile -t prod-incident-agent .
+agent/node_modules
+app/node_modules
+app/server/node_modules
+app/dist
+.env
+agent/.env
+app/.env
+*.log

@@ -1,0 +1,122 @@
+.error-banner {
+  margin: 0 20px 20px;
+  background: #1a0a0a;
+  border: 1px solid #7f1d1d;
+  border-radius: 10px;
+  overflow: hidden;
+  animation: slideIn 0.2s ease;
+}
+
+@keyframes slideIn {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.error-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid #7f1d1d40;
+}
+
+.error-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.error-icon {
+  font-size: 1rem;
+  color: #ef4444;
+}
+
+.error-title {
+  font-size: 0.875rem;
+  font-weight: 700;
+  color: #fca5a5;
+}
+
+.error-badge {
+  font-size: 0.65rem;
+  font-weight: 700;
+  background: #7f1d1d;
+  color: #fca5a5;
+  padding: 2px 7px;
+  border-radius: 4px;
+  letter-spacing: 0.04em;
+}
+
+.error-close {
+  background: none;
+  border: none;
+  color: #6b7280;
+  cursor: pointer;
+  font-size: 0.8rem;
+  padding: 2px 6px;
+  border-radius: 4px;
+  transition: color 0.15s;
+  flex-shrink: 0;
+}
+
+.error-close:hover {
+  color: #ef4444;
+}
+
+.error-code {
+  margin: 12px 16px 4px;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: #ef4444;
+}
+
+.error-message {
+  margin: 0 16px 8px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #fca5a5;
+  line-height: 1.4;
+}
+
+.error-detail {
+  margin: 0 16px 14px;
+  font-size: 0.78rem;
+  color: #9ca3af;
+  line-height: 1.55;
+}
+
+.error-meta {
+  margin: 0 16px 16px;
+  background: #0f1117;
+  border: 1px solid #2a2d3e;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.meta-row {
+  display: flex;
+  align-items: center;
+  padding: 7px 12px;
+  border-bottom: 1px solid #1e2235;
+  gap: 12px;
+}
+
+.meta-row:last-child {
+  border-bottom: none;
+}
+
+.meta-key {
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: #475569;
+  width: 90px;
+  flex-shrink: 0;
+}
+
+.meta-val {
+  font-size: 0.75rem;
+  color: #94a3b8;
+  font-family: 'Courier New', monospace;
+}

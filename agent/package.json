@@ -1,0 +1,19 @@
+{
+  "name": "agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "LangGraph.js agent that opens ServiceNow incidents from a unique identifier",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@langchain/core": "^0.3.18",
+    "@langchain/langgraph": "^0.2.20",
+    "@langchain/openai": "^0.3.14",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  }
+}
