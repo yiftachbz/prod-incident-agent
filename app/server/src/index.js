@@ -43,14 +43,26 @@ app.post("/api/provision", {
 }, async (req, reply) => {
   const { name, segment, zipCode } = req.body;
 
-  return reply.code(400).send({
-    ok: false,
-    code: "COVERAGE_UNAVAILABLE",
-    message: `No ${segment} coverage available in your domestic service area.`,
-    detail:
-      `The requested network segment "${segment}" could not be provisioned for zip code ${zipCode}. ` +
-      "No coverage is available in this area.",
-    requestId: `REQ-${Date.now()}`,
+  const hasCoverage = checkNetworkCoverageByZipCode(zipCode, segment);
+
+  if (!hasCoverage) {
+    return reply.code(400).send({
+      ok: false,
+      code: "COVERAGE_UNAVAILABLE",
+      message: `No ${segment} coverage available in your domestic service area.`,
+      detail:
+        `The requested network segment "${segment}" could not be provisioned for zip code ${zipCode}. ` +
+        "No coverage is available in this area.",
+      requestId: `REQ-${Date.now()}`,
+      segment,
+      zipCode,
+    });
+  }
+
+  return reply.code(200).send({
+    ok: true,
+    message: "Service provisioned successfully",
+    name,
     segment,
     zipCode,
   });
