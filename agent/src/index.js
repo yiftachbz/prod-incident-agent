@@ -1,7 +1,11 @@
 import "dotenv/config";
 import express from "express";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import { buildGraph } from "./graph.js";
 import { servicenowConfig } from "./servicenow.js";
+
+const execFileAsync = promisify(execFile);
 
 const PORT = Number(process.env.PORT ?? 8001);
 
@@ -131,6 +135,26 @@ app.post("/remediate", async (req, res) => {
   } catch (err) {
     console.error("[agent] remediation error:", err);
     return res.status(500).json({ ok: false, error: String(err?.message ?? err) });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /reset-demo  — resets app/server/src/index.js to the committed (buggy)
+// baseline so the remediation demo can be run repeatedly.
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.post("/reset-demo", async (_req, res) => {
+  const root = process.env.REPO_ROOT ?? ".";
+  try {
+    await execFileAsync(
+      "git", ["checkout", "app/server/src/index.js"],
+      { cwd: root }
+    );
+    console.log("[agent] demo reset: app/server/src/index.js restored to baseline");
+    return res.json({ ok: true, message: "app/server/src/index.js reset to buggy baseline" });
+  } catch (err) {
+    console.error("[agent] demo reset failed:", err.message);
+    return res.status(500).json({ ok: false, error: err.message });
   }
 });
 
