@@ -168,6 +168,10 @@ async function triageWithLLM(prompt) {
 }
 
 async function triage(state) {
+  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("[graph] ▶ NODE: triage");
+  console.log(`[graph]   prompt: "${(state.prompt ?? "").toString().slice(0, 120)}"`);
+
   const prompt = (state.prompt ?? "").toString().trim();
   if (!prompt) return { error: "prompt is required" };
 
@@ -175,7 +179,7 @@ async function triage(state) {
   const fallback = triageFallback(prompt);
   const triaged = llm ?? fallback;
 
-  return {
+  const result = {
     prompt,
     identifier: triaged.identifier ?? fallback.identifier,
     shortDescription: triaged.shortDescription || fallback.shortDescription,
@@ -184,10 +188,19 @@ async function triage(state) {
     impact: triaged.impact,
     category: triaged.category,
   };
+
+  console.log(`[graph]   identifier:        ${result.identifier ?? "(none)"}`);
+  console.log(`[graph]   shortDescription:  ${result.shortDescription}`);
+  console.log(`[graph]   urgency/impact:    ${result.urgency} / ${result.impact}`);
+  console.log(`[graph]   category:          ${result.category}`);
+  console.log(`[graph]   method:            ${llm ? "LLM" : "regex-fallback"}`);
+  return result;
 }
 
 async function createTicket(state) {
-  if (state.error) return {};
+  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("[graph] ▶ NODE: createTicket");
+  if (state.error) { console.log("[graph]   skipped (upstream error)"); return {}; }
   try {
     const fields = {
       short_description: state.shortDescription,
@@ -199,13 +212,21 @@ async function createTicket(state) {
     };
     if (state.identifier) fields.correlation_id = state.identifier;
     const ticket = await createIncident(fields);
+    console.log(`[graph]   [OK] Ticket created:  ${ticket.number ?? ticket.sys_id}`);
+    console.log(`[graph]   link:              ${ticket.link ?? "(none)"}`);
     return { ticket };
   } catch (err) {
+    console.error("[graph]   [FAIL] createTicket error:", err?.message ?? err);
     return { error: String(err?.message ?? err) };
   }
 }
 
 async function finalize(state) {
+  const hasRemediation = Boolean(state.incidentContext);
+  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("[graph] ▶ NODE: finalize");
+  console.log(`[graph]   ticket:            ${state.ticket?.number ?? "(none)"}`);
+  console.log(`[graph]   remediation path:  ${hasRemediation ? "YES — continuing to rcaAnalysis" : "NO — ending here"}`);
   return state;
 }
 
@@ -220,7 +241,9 @@ async function finalize(state) {
  * the root cause of the reported incident. Returns structured JSON.
  */
 async function rcaAnalysis(state) {
-  if (state.error) return {};
+  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("[graph] ▶ NODE: rcaAnalysis");
+  if (state.error) { console.log("[graph]   skipped (upstream error)"); return {}; }
 
   const root = repoRoot();
   const ctx = state.incidentContext ?? {};
@@ -256,10 +279,12 @@ async function rcaAnalysis(state) {
     throw new Error("[rcaAnalysis] LLM did not return a valid RCA result");
   }
 
-  // Ensure affectedFile is always the correct relative path
   result.affectedFile = "app/server/src/index.js";
 
-  console.log("[agent] RCA via LLM:", result.rootCause);
+  console.log(`[graph]   rootCause:         ${result.rootCause}`);
+  console.log(`[graph]   affectedFile:      ${result.affectedFile}`);
+  console.log(`[graph]   fixType:           ${result.fixType}`);
+  console.log(`[graph]   fixDescription:    ${result.fixDescription}`);
   return { rcaResult: result };
 }
 
@@ -270,7 +295,9 @@ async function rcaAnalysis(state) {
  * writes it to disk, then captures the git diff.
  */
 async function applyFix(state) {
-  if (state.error || !state.rcaResult) return {};
+  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("[graph] ▶ NODE: applyFix");
+  if (state.error || !state.rcaResult) { console.log("[graph]   skipped (no RCA result)"); return {}; }
 
   const root = repoRoot();
   const rca = state.rcaResult;
@@ -320,7 +347,9 @@ async function applyFix(state) {
     diff = "(diff unavailable)";
   }
 
-  console.log("[agent] fix applied via LLM:", result.summary);
+  console.log(`[graph]   fixSummary:        ${result.summary}`);
+  const diffLines = (diff || "").split("\n").length;
+  console.log(`[graph]   diff:              ${diffLines} lines`);
   return { fixDiff: diff || "(no diff — file may be unchanged)", fixSummary: result.summary };
 }
 
@@ -336,11 +365,14 @@ async function applyFix(state) {
  * sandboxPort: null so verifyScenario falls back to inline code analysis.
  */
 async function deploySandbox(state) {
-  if (state.error) return {};
+  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("[graph] ▶ NODE: deploySandbox");
+  if (state.error) { console.log("[graph]   skipped (upstream error)"); return {}; }
 
   const root = repoRoot();
 
   const { host, port } = await startSandbox(root);
+  console.log(`[graph]   sandbox:           ${host}:${port ?? "(unavailable — will use fallback)"}`);
   return { sandboxHost: host, sandboxPort: port };
 }
 
@@ -362,7 +394,9 @@ async function deploySandbox(state) {
  * Always stops the sandbox container before returning.
  */
 async function verifyScenario(state) {
-  if (state.error) return {};
+  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("[graph] ▶ NODE: verifyScenario");
+  if (state.error) { console.log("[graph]   skipped (upstream error)"); return {}; }
 
   const ctx = state.incidentContext ?? {};
   const segment = ctx.segment ?? "5G SA";
@@ -379,7 +413,9 @@ async function verifyScenario(state) {
     });
     const data = await res.json();
     const passed = res.status === 200 && data.ok === true;
-    console.log(`[agent] sandbox HTTP verify: ${passed ? "PASSED" : "FAILED"} (HTTP ${res.status})`);
+    console.log(`[graph]   result:            ${passed ? "[OK] PASSED" : "[FAIL] FAILED"} (HTTP ${res.status})`);
+    console.log(`[graph]   scenario:          segment=${segment}, zipCode=${zipCode}`);
+    console.log(`[graph]   testedAt:          ${testedAt}`);
     return {
       verifyResult: {
         passed,
@@ -403,6 +439,8 @@ async function verifyScenario(state) {
  * environment details.
  */
 async function generateReport(state) {
+  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("[graph] ▶ NODE: generateReport");
   const ticket = state.ticket ?? {};
   const ctx = state.incidentContext ?? {};
   const rca = state.rcaResult ?? {};
@@ -449,6 +487,7 @@ async function generateReport(state) {
     `- **Agent**: prod-incident-agent v0.1.0`,
   ].join("\n");
 
+  console.log(`[graph]   report:            ${report.split("\n").length} lines generated`);
   return { report };
 }
 
@@ -460,8 +499,10 @@ async function generateReport(state) {
  * or when the verification did not pass.
  */
 async function openPR(state) {
+  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("[graph] ▶ NODE: openPR");
   if (!state.verifyResult?.passed) {
-    console.log("[agent] verification did not pass — skipping PR creation");
+    console.log("[graph]   skipped — verification did not pass");
     return { prUrl: null, prError: "Skipped: code verification did not pass" };
   }
 
@@ -494,10 +535,10 @@ async function openPR(state) {
     );
 
     const url = prUrl.trim();
-    console.log("[agent] PR created:", url);
+    console.log(`[graph]   [OK] PR created:      ${url}`);
     return { prUrl: url };
   } catch (err) {
-    console.warn("[agent] PR creation failed:", err.message);
+    console.warn(`[graph]   [FAIL] PR failed:       ${err.message}`);
     return { prUrl: null, prError: err.message };
   }
 }

@@ -44,34 +44,6 @@ app.get("/health", (_req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /run  — simple ticket creation (existing flow)
-// ─────────────────────────────────────────────────────────────────────────────
-
-app.post("/run", async (req, res) => {
-  const prompt = (req.body?.prompt ?? "").toString().trim();
-  if (!prompt) {
-    return res.status(400).json({ ok: false, error: "Missing 'prompt' in request body" });
-  }
-
-  try {
-    const result = await graph.invoke({ prompt });
-    if (result.error) {
-      return res.status(502).json({ ok: false, error: result.error });
-    }
-    return res.json({
-      ok: true,
-      prompt: result.prompt,
-      identifier: result.identifier,
-      shortDescription: result.shortDescription,
-      ticket: result.ticket,
-    });
-  } catch (err) {
-    console.error("[agent] graph error:", err);
-    return res.status(500).json({ ok: false, error: String(err?.message ?? err) });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
 // POST /remediate  — full auto-remediation flow
 //
 // Body (all fields optional — sensible defaults are applied):
