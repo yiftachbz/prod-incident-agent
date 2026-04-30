@@ -15,7 +15,7 @@ const COVERAGE_DB = {
 // checkNetworkCoverageByZipCode
 // Returns true when the requested segment is available at the given zip code.
 // ---------------------------------------------------------------------------
-function checkNetworkCoverageByZipCode(zipCode, segment) {
+function checkNetworkCoverageByZipCode(segment, zipCode) {
   const coveredZips = COVERAGE_DB[segment] ?? [];
   return coveredZips.includes(String(zipCode).trim());
 }
@@ -43,7 +43,7 @@ app.post("/api/provision", {
 }, async (req, reply) => {
   const { name, segment, zipCode } = req.body;
 
-  const hasCoverage = checkNetworkCoverageByZipCode(zipCode, segment);
+  const hasCoverage = checkNetworkCoverageByZipCode(segment, zipCode);
 
   if (!hasCoverage) {
     return reply.code(400).send({
