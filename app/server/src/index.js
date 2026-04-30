@@ -16,7 +16,7 @@ const COVERAGE_DB = {
 // Returns true when the requested segment is available at the given zip code.
 // ---------------------------------------------------------------------------
 function checkNetworkCoverageByZipCode(zipCode, segment) {
-  const coveredZips = COVERAGE_DB[segment] ?? [];
+  const coveredZips = COVERAGE_DB[segment.trim()] ?? [];
   return coveredZips.includes(String(zipCode).trim());
 }
 
