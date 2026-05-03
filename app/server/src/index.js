@@ -55,6 +55,7 @@ app.get("/health", async () => ({ ok: true, service: "netprovision-server" }));
 
 // ---------------------------------------------------------------------------
 // POST /api/provision
+// BUG: always returns COVERAGE_UNAVAILABLE — never calls checkNetworkCoverageByZipCode
 // ---------------------------------------------------------------------------
 app.post("/api/provision", {
   schema: {
@@ -71,35 +72,21 @@ app.post("/api/provision", {
 }, async (req, reply) => {
   const { name, segment, zipCode } = req.body;
 
-  const hasCoverage = checkNetworkCoverageByZipCode(zipCode, segment);
-
-  if (!hasCoverage) {
-    return reply.code(400).send({
-      ok: false,
-      code: "COVERAGE_UNAVAILABLE",
-      message: `No ${segment} coverage available in your domestic service area.`,
-      detail:
-        `The requested network segment "${segment}" could not be provisioned for zip code ${zipCode}. ` +
-        "No coverage is available in this area.",
-      requestId: `REQ-${Date.now()}`,
-      segment,
-      zipCode,
-    });
-  }
-
-  return reply.send({
-    ok: true,
-    message: `Successfully provisioned ${segment} for ${name}`,
+  return reply.code(400).send({
+    ok: false,
+    code: "COVERAGE_UNAVAILABLE",
+    message: `No ${segment} coverage available in your domestic service area.`,
+    detail:
+      `The requested network segment "${segment}" could not be provisioned for zip code ${zipCode}. ` +
+      "No coverage is available in this area.",
+    requestId: `REQ-${Date.now()}`,
     segment,
     zipCode,
-    requestId: `REQ-${Date.now()}`,
   });
 });
 
 // ---------------------------------------------------------------------------
 // GET /api/_logs?sessionId=...&limit=200
-// Returns JSONL entries matching the sessionId (or all if omitted).
-// Requires X-Logs-Token header matching LOGS_TOKEN env var.
 // ---------------------------------------------------------------------------
 app.get("/api/_logs", async (req, reply) => {
   if (!checkLogsToken(req, reply)) return;
@@ -140,8 +127,6 @@ app.get("/api/_logs", async (req, reply) => {
 
 // ---------------------------------------------------------------------------
 // GET /api/_logs/recent-errors?limit=50
-// Returns the most recent error/warn log entries across all sessions.
-// Requires X-Logs-Token header matching LOGS_TOKEN env var.
 // ---------------------------------------------------------------------------
 app.get("/api/_logs/recent-errors", async (req, reply) => {
   if (!checkLogsToken(req, reply)) return;
