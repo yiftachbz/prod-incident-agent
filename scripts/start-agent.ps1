@@ -1,6 +1,17 @@
 # Start the LangGraph agent (port 8001)
 # Usage: .\scripts\start-agent.ps1
 # Optional -Dev flag enables --watch for auto-restart on file changes.
+#
+# Required agent\.env variables for the remediation path:
+#   REPO_URL       - e.g. https://github.com/yiftachbz/prod-incident-agent.git
+#   REPO_BRANCH    - default master
+#   GITHUB_TOKEN   - PAT with repo + PR access
+#   APP_BASE_URL   - base URL of the running app server (e.g. http://localhost:3001)
+#   LOGS_TOKEN     - shared secret matching LOGS_TOKEN in app/server/.env
+#   GIT_DEFAULT_BRANCH - base branch for PRs (default master)
+#
+# Local dev override (optional — skips git clone):
+#   REPO_ROOT      - absolute path to a local repo checkout
 
 param(
   [switch]$Dev

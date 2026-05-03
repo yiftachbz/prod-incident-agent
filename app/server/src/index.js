@@ -1,4 +1,8 @@
 import "dotenv/config";
+import { createReadStream } from "node:fs";
+import { stat } from "node:fs/promises";
+import { createInterface } from "node:readline";
+import path from "node:path";
 import Fastify from "fastify";
 
 const PORT = Number(process.env.SERVER_PORT ?? 3001);
@@ -18,6 +22,30 @@ const COVERAGE_DB = {
 function checkNetworkCoverageByZipCode(zipCode, segment) {
   const coveredZips = COVERAGE_DB[segment] ?? [];
   return coveredZips.includes(String(zipCode).trim());
+}
+
+// ---------------------------------------------------------------------------
+// Log file path (same default the agent used to read directly)
+// ---------------------------------------------------------------------------
+function resolveLogFile() {
+  if (process.env.LOG_PATH) return path.resolve(process.env.LOG_PATH);
+  return path.join(process.cwd(), "logs", "server.jsonl");
+}
+
+// ---------------------------------------------------------------------------
+// Auth check for internal log endpoints
+// ---------------------------------------------------------------------------
+function checkLogsToken(req, reply) {
+  const secret = process.env.LOGS_TOKEN;
+  if (!secret) {
+    reply.code(503).send({ ok: false, error: "LOGS_TOKEN not configured on server" });
+    return false;
+  }
+  if (req.headers["x-logs-token"] !== secret) {
+    reply.code(401).send({ ok: false, error: "Unauthorized" });
+    return false;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -43,17 +71,113 @@ app.post("/api/provision", {
 }, async (req, reply) => {
   const { name, segment, zipCode } = req.body;
 
-  return reply.code(400).send({
-    ok: false,
-    code: "COVERAGE_UNAVAILABLE",
-    message: `No ${segment} coverage available in your domestic service area.`,
-    detail:
-      `The requested network segment "${segment}" could not be provisioned for zip code ${zipCode}. ` +
-      "No coverage is available in this area.",
-    requestId: `REQ-${Date.now()}`,
+  const hasCoverage = checkNetworkCoverageByZipCode(zipCode, segment);
+
+  if (!hasCoverage) {
+    return reply.code(400).send({
+      ok: false,
+      code: "COVERAGE_UNAVAILABLE",
+      message: `No ${segment} coverage available in your domestic service area.`,
+      detail:
+        `The requested network segment "${segment}" could not be provisioned for zip code ${zipCode}. ` +
+        "No coverage is available in this area.",
+      requestId: `REQ-${Date.now()}`,
+      segment,
+      zipCode,
+    });
+  }
+
+  return reply.send({
+    ok: true,
+    message: `Successfully provisioned ${segment} for ${name}`,
     segment,
     zipCode,
+    requestId: `REQ-${Date.now()}`,
   });
 });
+
+// ---------------------------------------------------------------------------
+// GET /api/_logs?sessionId=...&limit=200
+// Returns JSONL entries matching the sessionId (or all if omitted).
+// Requires X-Logs-Token header matching LOGS_TOKEN env var.
+// ---------------------------------------------------------------------------
+app.get("/api/_logs", async (req, reply) => {
+  if (!checkLogsToken(req, reply)) return;
+
+  const sessionId = req.query.sessionId ?? null;
+  const limit = Math.min(Number(req.query.limit ?? 200), 1000);
+  const logFile = resolveLogFile();
+
+  try {
+    await stat(logFile);
+  } catch {
+    return reply.send({ found: false, entries: [] });
+  }
+
+  const entries = [];
+  const rl = createInterface({
+    input: createReadStream(logFile, { encoding: "utf8" }),
+    crlfDelay: Infinity,
+  });
+
+  for await (const raw of rl) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (sessionId && !line.includes(sessionId)) continue;
+    try {
+      const obj = JSON.parse(line);
+      if (!sessionId || obj.sessionId === sessionId) {
+        entries.push(obj);
+        if (entries.length >= limit) break;
+      }
+    } catch {
+      // skip malformed lines
+    }
+  }
+
+  return reply.send({ found: entries.length > 0, entries });
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/_logs/recent-errors?limit=50
+// Returns the most recent error/warn log entries across all sessions.
+// Requires X-Logs-Token header matching LOGS_TOKEN env var.
+// ---------------------------------------------------------------------------
+app.get("/api/_logs/recent-errors", async (req, reply) => {
+  if (!checkLogsToken(req, reply)) return;
+
+  const limit = Math.min(Number(req.query.limit ?? 50), 500);
+  const logFile = resolveLogFile();
+
+  try {
+    await stat(logFile);
+  } catch {
+    return reply.send({ found: false, entries: [] });
+  }
+
+  const buffer = [];
+  const rl = createInterface({
+    input: createReadStream(logFile, { encoding: "utf8" }),
+    crlfDelay: Infinity,
+  });
+
+  for await (const raw of rl) {
+    const line = raw.trim();
+    if (!line) continue;
+    try {
+      const obj = JSON.parse(line);
+      if (obj.level === "error" || obj.level === "warn") {
+        buffer.push(obj);
+        if (buffer.length > limit) buffer.shift();
+      }
+    } catch {
+      // skip malformed lines
+    }
+  }
+
+  return reply.send({ found: buffer.length > 0, entries: buffer });
+});
+
+// ---------------------------------------------------------------------------
 
 await app.listen({ port: PORT, host: "0.0.0.0" });

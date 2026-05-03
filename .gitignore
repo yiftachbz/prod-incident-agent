@@ -7,3 +7,7 @@ node_modules/
 .idea/
 dist/
 build/
+
+# Server session logs (JSONL) — runtime artefact pulled by the agent
+app/server/logs/
+

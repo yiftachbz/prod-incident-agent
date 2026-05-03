@@ -22,8 +22,8 @@ export default function ErrorBanner({ error, onDismiss }) {
           <span className="meta-val">{error.segment}</span>
         </div>
         <div className="meta-row">
-          <span className="meta-key">Request ID</span>
-          <span className="meta-val">{error.requestId}</span>
+          <span className="meta-key">Session ID</span>
+          <span className="meta-val">{error.sessionId ?? error.requestId}</span>
         </div>
       </div>
     </div>

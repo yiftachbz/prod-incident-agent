@@ -64,3 +64,55 @@ export async function createIncident(fields) {
 
   return { sys_id: sysId, number, link, raw: result };
 }
+
+/**
+ * Update an existing incident record. Used by the remediation graph to
+ * resolve / close the ticket once the fix has been verified and (optionally)
+ * a PR has been opened.
+ *
+ * Common ServiceNow `state` values:
+ *   "1" New, "2" In Progress, "3" On Hold, "6" Resolved, "7" Closed, "8" Canceled
+ *
+ * Resolving an incident requires both `close_code` and `close_notes`.
+ *
+ * @param {string} sysId   sys_id of the incident to update
+ * @param {object} fields  e.g. { state, close_code, close_notes, work_notes }
+ * @returns {Promise<{sys_id: string, number: string, state: string, raw: object}>}
+ */
+export async function updateIncident(sysId, fields) {
+  if (!sysId) throw new Error("updateIncident: sysId is required");
+
+  const { baseUrl, user, password } = servicenowConfig();
+  const url = `${baseUrl}/api/now/table/incident/${encodeURIComponent(sysId)}`;
+
+  const res = await fetch(url, {
+    method: "PATCH",
+    headers: {
+      Authorization: basicAuthHeader(user, password),
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(fields),
+  });
+
+  const text = await res.text();
+  let body;
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch {
+    body = { raw: text };
+  }
+
+  if (!res.ok) {
+    const detail = body?.error?.message || body?.raw || res.statusText;
+    throw new Error(`ServiceNow ${res.status}: ${detail}`);
+  }
+
+  const result = body?.result ?? {};
+  return {
+    sys_id: result.sys_id ?? sysId,
+    number: result.number,
+    state: result.state,
+    raw: result,
+  };
+}

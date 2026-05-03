@@ -9,7 +9,9 @@ Browser
                             ↘ COVERAGE_UNAVAILABLE error
                               └─▶ agent (LangGraph, port 8001)
                                     ├─▶ ServiceNow (create incident)
-                                    ├─▶ Claude CLI (RCA + fix)
+                                    ├─▶ GitHub (shallow clone source)
+                                    ├─▶ app/server GET /api/_logs (fetch runtime logs)
+                                    ├─▶ LLM (RCA + fix)
                                     ├─▶ Docker sandbox (verify fix)
                                     └─▶ GitHub (open PR)
 ```
@@ -23,7 +25,9 @@ Browser
 │   │   ├── index.js        # Express server — POST /run, POST /remediate
 │   │   ├── graph.js        # LangGraph state machine
 │   │   ├── servicenow.js   # ServiceNow Table API client
-│   │   └── sandbox.js      # Docker sandbox helpers
+│   │   ├── sandbox.js      # Docker sandbox helpers
+│   │   ├── workspace.js    # Shallow git clone lifecycle
+│   │   └── logs.js         # Fetches runtime logs from app/server HTTP endpoint
 │   ├── Dockerfile
 │   └── package.json
 ├── app/                # React / Vite frontend  (port 3000 in dev)
@@ -34,7 +38,7 @@ Browser
 │   ├── nginx.conf           # Proxies /api/ → app/server
 │   └── vite.config.js
 └── app/server/         # Fastify provisioning API  (port 3001)
-    ├── src/index.js         # GET /health, POST /api/provision
+    ├── src/index.js         # GET /health, POST /api/provision, GET /api/_logs
     ├── Dockerfile
     └── package.json
 ```
@@ -48,7 +52,8 @@ cd app;         npm install; cd ..
 cd app\server;  npm install; cd ..\..
 
 # 2. Configure
-copy agent\.env.example agent\.env   # fill in ServiceNow creds + LLM key
+copy agent\.env.example agent\.env         # fill in ServiceNow creds, LLM key, GitHub token
+copy app\server\.env.example app\server\.env  # set LOGS_TOKEN (must match agent value)
 
 # 3. Run (three terminals)
 cd agent;      npm start    # → http://localhost:8001
@@ -76,20 +81,24 @@ Triggered by `POST /remediate`. Continues after `finalize` via conditional edge.
 
 | Node | What it does |
 |------|-------------|
-| `rcaAnalysis` | Shells out to **`claude --print`** with file-system tools to identify root cause (`affectedFile`, `fixType`, etc.). |
-| `applyFix` | Calls `claude` again to apply the actual code change; captures the unified diff. |
-| `deploySandbox` | Builds and runs the `app/server` image in Docker (via `sandbox.js`); falls back gracefully when Docker is unavailable. |
-| `verifyScenario` | Sends a `POST /api/provision` to the sandbox and checks the response matches expectations. |
-| `generateReport` | Asks `claude` to write a full markdown remediation report. |
-| `openPR` | Runs `git` + `gh` to commit the fix and open a GitHub pull request when verification passes. |
+| `cloneRepo` | Shallow-clones the GitHub repo (`REPO_URL`) into a fresh temp directory. Skipped when `REPO_ROOT` is set (local dev override). |
+| `pullLogs` | Fetches runtime log entries from `GET APP_BASE_URL/api/_logs` using the `LOGS_TOKEN` shared secret. |
+| `rcaAnalysis` | Reads the cloned source + log evidence, asks the LLM to identify the root cause. |
+| `applyFix` | Asks the LLM for the fixed file; writes it to the workspace and captures the git diff. |
+| `deploySandbox` | Builds and runs the `app/server` image in Docker (via `sandbox.js`). |
+| `verifyScenario` | Sends a `POST /api/provision` to the sandbox and asserts a 200 response. |
+| `generateReport` | Builds a structured markdown remediation report. |
+| `openPR` | Commits the fix and opens a GitHub pull request from the workspace clone. |
+| `cleanupWorkspace` | Removes the temp clone directory. No-op when `REPO_ROOT` was used. |
 
 ```
 START → triage → createTicket → finalize
                                     │
                     incidentContext? │ yes
                                     ▼
-              rcaAnalysis → applyFix → deploySandbox
-                → verifyScenario → generateReport → openPR → END
+              cloneRepo → pullLogs → rcaAnalysis → applyFix
+                → deploySandbox → verifyScenario → generateReport
+                → openPR → closeTicket → cleanupWorkspace → END
 ```
 
 ## API reference
@@ -141,6 +150,14 @@ Full auto-remediation pipeline.
 { "ok": false, "errorCode": "COVERAGE_UNAVAILABLE", "message": "No coverage available" }
 ```
 
+### Provisioning API (`GET /api/_logs`)
+Internal endpoint used by the agent to fetch runtime log evidence. Requires `X-Logs-Token` header.
+
+```
+GET /api/_logs?sessionId=SES-...&limit=200
+GET /api/_logs/recent-errors?limit=50
+```
+
 ## Environment variables
 
 ### `agent/.env`
@@ -153,15 +170,22 @@ Full auto-remediation pipeline.
 | `SERVICENOW_PASSWORD` | — | ServiceNow basic-auth password |
 | `OPENAI_API_KEY` | — | Optional — enables LLM triage |
 | `OPENAI_BASE_URL` / `LITELLM_BASE_URL` | — | Optional — use a custom / local LLM endpoint |
-| `REPO_ROOT` | `cwd` | Absolute path to repo root (Docker: `/repo`) |
-| `GIT_DEFAULT_BRANCH` | `master` | Base branch for PRs |
-| `SANDBOX_PORT` | `3001` | Port the sandbox container is published on |
+| `REPO_URL` | — | GitHub repo URL, e.g. `https://github.com/yiftachbz/prod-incident-agent.git` |
+| `REPO_BRANCH` | `master` | Branch to clone for each remediation run |
+| `GITHUB_TOKEN` | — | PAT with repo read/write + PR creation access |
+| `APP_BASE_URL` | — | Base URL of the running app server, e.g. `http://localhost:3001` |
+| `LOGS_TOKEN` | — | Shared secret for `GET /api/_logs` (must match `app/server` value) |
+| `GIT_DEFAULT_BRANCH` | `master` | Base branch for auto-generated PRs |
+| `SANDBOX_PORT` | `3001` | Port the sandbox container listens on |
+| `REPO_ROOT` | _(unset)_ | **Local dev only** — skips git clone and reads files from this path instead |
 
 ### `app/server/.env`
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `SERVER_PORT` | `3001` | Provisioning API HTTP port |
+| `LOGS_TOKEN` | — | Shared secret for `GET /api/_logs`. Endpoint returns 503 when unset (fail-closed). |
+| `LOG_PATH` | `<cwd>/logs/server.jsonl` | Override JSONL log file location |
 
 ### Frontend build
 
@@ -184,7 +208,5 @@ Each service has its own Dockerfile. No compose file is included — run them in
 | Agent | `agent/Dockerfile` | `8001` |
 | Frontend (nginx) | `app/Dockerfile` | `80` |
 | Provisioning API | `app/server/Dockerfile` | `3001` |
-
-The `agent/Dockerfile` copies the **full repo** to `/repo` (for RCA file access) and installs `git`, `curl`, Docker CLI, and `gh` at build time.
 
 > **Note:** `agent/.env` is git-ignored. Rotate the ServiceNow password before sharing this repo publicly.

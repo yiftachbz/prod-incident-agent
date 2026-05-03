@@ -2,9 +2,11 @@ import { StateGraph, START, END, Annotation } from "@langchain/langgraph";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import path from "path";
-import { readFile, writeFile } from "fs/promises";
-import { createIncident } from "./servicenow.js";
+import { readFile, writeFile, rm } from "fs/promises";
+import { createIncident, updateIncident } from "./servicenow.js";
 import { startSandbox, stopSandbox } from "./sandbox.js";
+import { pullLogsForSession, pullRecentErrors, summarizeLogs } from "./logs.js";
+import { cloneRepoToTemp, resolveWorkspacePath } from "./workspace.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -25,8 +27,10 @@ const AgentState = Annotation.Root({
   error: Annotation(),
 
   // ── Remediation fields (new) ───────────────────────────────────────────────
-  /** { segment, zipCode, errorCode, message } — triggers the remediation path */
+  /** { segment, zipCode, errorCode, message, sessionId } — triggers the remediation path */
   incidentContext: Annotation(),
+  /** { logFile, found, entries: [...], summaryLines: [...], source: "session"|"recent-errors"|"none" } */
+  logsContext: Annotation(),
   /** { rootCause, affectedFile, fixDescription, fixType } */
   rcaResult: Annotation(),
   /** Unified diff string produced after the fix */
@@ -45,6 +49,10 @@ const AgentState = Annotation.Root({
   prUrl: Annotation(),
   /** Error message from the PR step (null on success) */
   prError: Annotation(),
+  /** { resolved, state, action, error } — outcome of the closeTicket node */
+  ticketClose: Annotation(),
+  /** Absolute path to the shallow-cloned temp workspace (null when REPO_ROOT is used) */
+  workspacePath: Annotation(),
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -63,10 +71,6 @@ function extractJsonObject(text) {
   const end = candidate.lastIndexOf("}");
   if (start === -1 || end === -1 || end <= start) return null;
   return candidate.slice(start, end + 1);
-}
-
-function repoRoot() {
-  return process.env.REPO_ROOT ?? path.resolve(".");
 }
 
 /**
@@ -235,17 +239,128 @@ async function finalize(state) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
+ * cloneRepo
+ *
+ * Shallow-clones the GitHub repo into a fresh temp directory so the agent
+ * has its own isolated copy of the source code to read, patch, and build.
+ *
+ * When REPO_ROOT is set (local dev override), skips the clone and returns
+ * that path directly — the cleanup node will also be a no-op in that case.
+ */
+async function cloneRepo(state) {
+  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("[graph] ▶ NODE: cloneRepo");
+  if (state.error) { console.log("[graph]   skipped (upstream error)"); return {}; }
+
+  if (process.env.REPO_ROOT) {
+    console.log(`[graph]   REPO_ROOT override set — skipping clone: ${process.env.REPO_ROOT}`);
+    return { workspacePath: process.env.REPO_ROOT };
+  }
+
+  const repoUrl = process.env.REPO_URL;
+  const branch  = process.env.REPO_BRANCH ?? "master";
+  const token   = process.env.GITHUB_TOKEN;
+
+  if (!repoUrl || !token) {
+    throw new Error("[cloneRepo] REPO_URL and GITHUB_TOKEN are required when REPO_ROOT is not set");
+  }
+
+  const { workspacePath } = await cloneRepoToTemp({ repoUrl, branch, token });
+  console.log(`[graph]   workspacePath:     ${workspacePath}`);
+  return { workspacePath };
+}
+
+/**
+ * cleanupWorkspace
+ *
+ * Removes the temp clone created by cloneRepo. No-op when REPO_ROOT was
+ * used (dev override). Best-effort — never throws.
+ */
+async function cleanupWorkspace(state) {
+  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("[graph] ▶ NODE: cleanupWorkspace");
+
+  if (process.env.REPO_ROOT || !state.workspacePath) {
+    console.log("[graph]   skipped (REPO_ROOT override or no workspace path)");
+    return {};
+  }
+
+  try {
+    await rm(state.workspacePath, { recursive: true, force: true });
+    console.log(`[graph]   removed:           ${state.workspacePath}`);
+  } catch (err) {
+    console.warn(`[graph]   cleanup failed (ignored): ${err.message}`);
+  }
+  return {};
+}
+
+/**
+ * pullLogs
+ *
+ * Reads the app's structured JSONL log file and filters every entry that
+ * carries the failing sessionId / identifier. The collected entries become
+ * primary evidence for rcaAnalysis — the LLM sees what the server actually
+ * did at runtime, not just what its source code looks like.
+ *
+ * Resolution order for the correlation key:
+ *   1. state.incidentContext.sessionId  (explicit)
+ *   2. state.identifier                 (extracted from the prompt by triage)
+ *   3. fallback: most recent error entries in the log file
+ */
+async function pullLogs(state) {
+  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("[graph] ▶ NODE: pullLogs");
+  if (state.error) { console.log("[graph]   skipped (upstream error)"); return {}; }
+
+  const ctx = state.incidentContext ?? {};
+  const sessionId = ctx.sessionId ?? state.identifier ?? null;
+
+  let result;
+  let source;
+
+  if (sessionId) {
+    console.log(`[graph]   sessionId:         ${sessionId}`);
+    result = await pullLogsForSession(sessionId, null, { limit: 200 });
+    source = result.found ? "session" : "session-miss";
+  } else {
+    console.log(`[graph]   sessionId:         (none — falling back to recent errors)`);
+    result = await pullRecentErrors(null, { limit: 50 });
+    source = result.found ? "recent-errors" : "none";
+  }
+
+  const summaryLines = summarizeLogs(result.entries);
+  console.log(`[graph]   logFile:           ${result.logFile}`);
+  console.log(`[graph]   matched entries:   ${result.entries.length} (source=${source})`);
+  if (summaryLines.length > 0) {
+    console.log(`[graph]   first line:        ${summaryLines[0].slice(0, 160)}`);
+  }
+
+  return {
+    logsContext: {
+      logFile: result.logFile,
+      found: result.found,
+      entries: result.entries,
+      summaryLines,
+      source,
+      sessionId,
+    },
+  };
+}
+
+/**
  * rcaAnalysis
  *
  * Reads app/server/src/index.js directly and asks the LLM to identify
- * the root cause of the reported incident. Returns structured JSON.
+ * the root cause of the reported incident. Combines static source-code
+ * analysis with the runtime log evidence collected by `pullLogs` so the
+ * LLM can correlate symptoms in logs with the offending code path.
  */
 async function rcaAnalysis(state) {
   console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   console.log("[graph] ▶ NODE: rcaAnalysis");
   if (state.error) { console.log("[graph]   skipped (upstream error)"); return {}; }
 
-  const root = repoRoot();
+  const root = resolveWorkspacePath(state);
   const ctx = state.incidentContext ?? {};
   const segment = ctx.segment ?? "5G SA";
   const zipCode = ctx.zipCode ?? "94105";
@@ -254,9 +369,18 @@ async function rcaAnalysis(state) {
   const serverFile = path.join(root, "app", "server", "src", "index.js");
   const fileContent = await readFile(serverFile, "utf8");
 
+  const logs = state.logsContext ?? { entries: [], summaryLines: [], source: "none" };
+  const logsBlock =
+    logs.summaryLines.length > 0
+      ? logs.summaryLines.slice(-25).join("\n")
+      : "(no log entries available)";
+
   const systemPrompt = [
     "You are a production incident analyst.",
-    "Analyze the provided server code and identify the exact root cause of the reported error.",
+    "You are given (a) runtime log entries from the server, correlated by sessionId,",
+    "and (b) the current server source code.",
+    "Use the logs to confirm what the server actually did at runtime, then analyze",
+    "the source code to identify the exact root cause and propose a minimal fix.",
     "Return ONLY a JSON object with no prose, no markdown fences:",
     '{ "rootCause": "<one sentence>", "affectedFile": "app/server/src/index.js", "fixDescription": "<what to change>", "fixType": "missing_call" | "wrong_logic" | "config_error" }',
   ].join("\n");
@@ -264,6 +388,13 @@ async function rcaAnalysis(state) {
   const userContent = [
     `Incident: POST /api/provision returns ${errorCode} for segment="${segment}", zipCode="${zipCode}".`,
     `Message: ${ctx.message ?? "No coverage available"}`,
+    `Correlation key (sessionId): ${logs.sessionId ?? "(none)"}`,
+    `Log source: ${logs.source}  •  matched entries: ${logs.entries.length}`,
+    "",
+    "Runtime log evidence (most recent entries for this session):",
+    "```",
+    logsBlock,
+    "```",
     "",
     "Server code (app/server/src/index.js):",
     "```javascript",
@@ -299,7 +430,7 @@ async function applyFix(state) {
   console.log("[graph] ▶ NODE: applyFix");
   if (state.error || !state.rcaResult) { console.log("[graph]   skipped (no RCA result)"); return {}; }
 
-  const root = repoRoot();
+  const root = resolveWorkspacePath(state);
   const rca = state.rcaResult;
   const serverFile = path.join(root, "app", "server", "src", "index.js");
   const fileContent = await readFile(serverFile, "utf8");
@@ -337,9 +468,11 @@ async function applyFix(state) {
   // Capture the git diff
   let diff = "";
   try {
+    const diffEnv = { ...process.env };
+    if (process.env.GH_PATH) diffEnv.PATH = `${process.env.GH_PATH};${diffEnv.PATH}`;
     const { stdout } = await execFileAsync(
       "git", ["diff", "app/server/src/index.js"],
-      { cwd: root, maxBuffer: 1024 * 1024 }
+      { cwd: root, maxBuffer: 1024 * 1024, env: diffEnv }
     );
     diff = stdout.trim();
   } catch (err) {
@@ -369,7 +502,7 @@ async function deploySandbox(state) {
   console.log("[graph] ▶ NODE: deploySandbox");
   if (state.error) { console.log("[graph]   skipped (upstream error)"); return {}; }
 
-  const root = repoRoot();
+  const root = resolveWorkspacePath(state);
 
   const { host, port } = await startSandbox(root);
   console.log(`[graph]   sandbox:           ${host}:${port ?? "(unavailable — will use fallback)"}`);
@@ -445,9 +578,15 @@ async function generateReport(state) {
   const ctx = state.incidentContext ?? {};
   const rca = state.rcaResult ?? {};
   const verify = state.verifyResult ?? {};
+  const logs = state.logsContext ?? { entries: [], summaryLines: [], source: "none" };
 
   const verifyBadge = verify.passed ? "PASSED" : "FAILED";
   const now = new Date().toISOString();
+
+  const logEvidenceLines =
+    logs.summaryLines.length > 0
+      ? logs.summaryLines.slice(-15).map((l) => `    ${l}`).join("\n")
+      : "    (no log entries matched)";
 
   const report = [
     "# Incident Auto-Remediation Report",
@@ -455,10 +594,20 @@ async function generateReport(state) {
     "## Incident",
     `- **Ticket**: ${ticket.number ?? "N/A"}`,
     `- **ServiceNow link**: ${ticket.link ?? "N/A"}`,
+    `- **Session ID**: ${logs.sessionId ?? ctx.sessionId ?? "N/A"}`,
     `- **Segment**: ${ctx.segment ?? "N/A"}`,
     `- **Zip code**: ${ctx.zipCode ?? "N/A"}`,
     `- **Error code**: ${ctx.errorCode ?? "N/A"}`,
     `- **Generated**: ${now}`,
+    "",
+    "## Log Evidence",
+    `- **Log file**: \`${logs.logFile ?? "N/A"}\``,
+    `- **Source**: ${logs.source}`,
+    `- **Matched entries**: ${logs.entries.length}`,
+    "",
+    "```",
+    logEvidenceLines,
+    "```",
     "",
     "## Root Cause Analysis",
     `**Root cause**: ${rca.rootCause ?? "N/A"}`,
@@ -506,7 +655,7 @@ async function openPR(state) {
     return { prUrl: null, prError: "Skipped: code verification did not pass" };
   }
 
-  const root = repoRoot();
+  const root = resolveWorkspacePath(state);
   const branch = `fix/coverage-check-${Date.now()}`;
   const base = process.env.GIT_DEFAULT_BRANCH ?? "master";
   const commitMsg = [
@@ -518,20 +667,25 @@ async function openPR(state) {
   ].join("\n");
 
   try {
-    await execFileAsync("git", ["checkout", "-b", branch], { cwd: root });
-    await execFileAsync("git", ["add", "app/server/src/index.js"], { cwd: root });
-    await execFileAsync("git", ["commit", "-m", commitMsg], { cwd: root });
-    await execFileAsync("git", ["push", "-u", "origin", branch], { cwd: root });
+    const gitEnv = { ...process.env };
+    if (process.env.GH_PATH) gitEnv.PATH = `${process.env.GH_PATH};${gitEnv.PATH}`;
+    const gitOpts = { cwd: root, env: gitEnv };
+
+    await execFileAsync("git", ["checkout", "-b", branch], gitOpts);
+    await execFileAsync("git", ["add", "app/server/src/index.js"], gitOpts);
+    await execFileAsync("git", ["commit", "-m", commitMsg], gitOpts);
+    await execFileAsync("git", ["push", "-u", "origin", branch], gitOpts);
 
     const { stdout: prUrl } = await execFileAsync(
       "gh",
       [
         "pr", "create",
         "--base", base,
+        "--head", branch,
         "--title", "fix: add coverage check to 5G provisioning handler",
         "--body", state.report ?? "Auto-remediation report unavailable.",
       ],
-      { cwd: root, maxBuffer: 1024 * 1024 }
+      { cwd: root, maxBuffer: 1024 * 1024, env: gitEnv }
     );
 
     const url = prUrl.trim();
@@ -543,38 +697,122 @@ async function openPR(state) {
   }
 }
 
+/**
+ * closeTicket
+ *
+ * Updates the ServiceNow incident created by `createTicket` based on the
+ * remediation outcome:
+ *
+ *   • verification PASSED  → resolve the incident (state=6) with close_code +
+ *     close_notes (full markdown report). PR URL is appended when available.
+ *   • verification FAILED  → leave the ticket open but post a `work_notes`
+ *     update with the report so the on-call engineer has the evidence.
+ *
+ * Skips silently when no ticket was created (createTicket failed earlier).
+ */
+async function closeTicket(state) {
+  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("[graph] ▶ NODE: closeTicket");
+
+  const sysId = state.ticket?.sys_id;
+  if (!sysId) {
+    console.log("[graph]   skipped — no ticket sys_id available");
+    return { ticketClose: { resolved: false, action: "skipped-no-ticket" } };
+  }
+
+  const passed = Boolean(state.verifyResult?.passed);
+  const prSuffix = state.prUrl
+    ? `\n\nPull request: ${state.prUrl}`
+    : state.prError
+      ? `\n\nPR creation skipped/failed: ${state.prError}`
+      : "";
+  const reportBody = (state.report ?? "Auto-remediation report unavailable.") + prSuffix;
+
+  try {
+    if (passed) {
+      const fields = {
+        state: "6",
+        close_code: "Solved (Permanently)",
+        close_notes: reportBody,
+        work_notes: state.prUrl
+          ? `Auto-remediated by prod-incident-agent. PR: ${state.prUrl}`
+          : "Auto-remediated by prod-incident-agent (verification passed; no PR opened).",
+      };
+      const result = await updateIncident(sysId, fields);
+      console.log(`[graph]   [OK] ticket resolved: ${state.ticket?.number ?? sysId} (state=${result.state ?? "6"})`);
+      return {
+        ticketClose: {
+          resolved: true,
+          state: result.state ?? "6",
+          action: "resolved",
+        },
+      };
+    }
+
+    const fields = {
+      work_notes: `Auto-remediation verification FAILED — ticket left open.\n\n${reportBody}`,
+    };
+    const result = await updateIncident(sysId, fields);
+    console.log(`[graph]   [INFO] verification failed — ticket ${state.ticket?.number ?? sysId} kept open with work_notes`);
+    return {
+      ticketClose: {
+        resolved: false,
+        state: result.state ?? null,
+        action: "work-notes-only",
+      },
+    };
+  } catch (err) {
+    console.warn(`[graph]   [FAIL] closeTicket error: ${err.message}`);
+    return {
+      ticketClose: {
+        resolved: false,
+        action: "error",
+        error: err.message,
+      },
+    };
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Graph assembly
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function buildGraph() {
   const graph = new StateGraph(AgentState)
-    // existing nodes
+    // ticket nodes
     .addNode("triage", triage)
     .addNode("createTicket", createTicket)
     .addNode("finalize", finalize)
     // remediation nodes
+    .addNode("cloneRepo", cloneRepo)
+    .addNode("pullLogs", pullLogs)
     .addNode("rcaAnalysis", rcaAnalysis)
     .addNode("applyFix", applyFix)
     .addNode("deploySandbox", deploySandbox)
     .addNode("verifyScenario", verifyScenario)
     .addNode("generateReport", generateReport)
     .addNode("openPR", openPR)
-    // existing edges
+    .addNode("closeTicket", closeTicket)
+    .addNode("cleanupWorkspace", cleanupWorkspace)
+    // ticket edges
     .addEdge(START, "triage")
     .addEdge("triage", "createTicket")
     .addEdge("createTicket", "finalize")
     // conditional: remediation only when incidentContext is present
     .addConditionalEdges("finalize", (state) =>
-      state.incidentContext ? "rcaAnalysis" : END
+      state.incidentContext ? "cloneRepo" : END
     )
     // remediation chain
+    .addEdge("cloneRepo", "pullLogs")
+    .addEdge("pullLogs", "rcaAnalysis")
     .addEdge("rcaAnalysis", "applyFix")
     .addEdge("applyFix", "deploySandbox")
     .addEdge("deploySandbox", "verifyScenario")
     .addEdge("verifyScenario", "generateReport")
     .addEdge("generateReport", "openPR")
-    .addEdge("openPR", END);
+    .addEdge("openPR", "closeTicket")
+    .addEdge("closeTicket", "cleanupWorkspace")
+    .addEdge("cleanupWorkspace", END);
 
   return graph.compile();
 }
