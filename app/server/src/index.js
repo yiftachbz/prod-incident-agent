@@ -43,6 +43,17 @@ app.post("/api/provision", {
 }, async (req, reply) => {
   const { name, segment, zipCode } = req.body;
 
+  const hasCoverage = checkNetworkCoverageByZipCode(zipCode, segment);
+
+  if (hasCoverage) {
+    return reply.code(200).send({
+      ok: true,
+      message: `Successfully provisioned ${segment} for ${name} in zip code ${zipCode}.`,
+      segment,
+      zipCode,
+    });
+  }
+
   return reply.code(400).send({
     ok: false,
     code: "COVERAGE_UNAVAILABLE",
