@@ -23,6 +23,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
+# Claude CLI — used for all LLM calls (RCA, code fix, triage) via AWS Bedrock.
+# Credentials are supplied at runtime via CLAUDE_CODE_USE_BEDROCK + AWS_* env vars.
+RUN npm install -g @anthropic-ai/claude-code
+
 # ── Agent service (lives in agent/) ────────────────────────────────────────
 WORKDIR /app
 COPY agent/package.json ./

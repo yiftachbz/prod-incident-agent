@@ -1,8 +1,9 @@
 import { StateGraph, START, END, Annotation } from "@langchain/langgraph";
-import { execFile } from "child_process";
+import { execFile, spawn } from "child_process";
 import { promisify } from "util";
+import { tmpdir } from "os";
 import path from "path";
-import { readFile, writeFile, rm } from "fs/promises";
+import { readFile, writeFile, rm, unlink } from "fs/promises";
 import { createIncident, updateIncident } from "./servicenow.js";
 import { startSandbox, stopSandbox } from "./sandbox.js";
 import { pullLogsForSession, pullRecentErrors, summarizeLogs } from "./logs.js";
@@ -74,29 +75,63 @@ function extractJsonObject(text) {
 }
 
 /**
- * Call the configured LLM (LiteLLM proxy or OpenAI) with a prompt.
- * Returns parsed JSON from the response, or throws on failure.
+ * Call Claude CLI in bare non-interactive mode via AWS Bedrock.
+ *
+ * Strategy (avoids Windows cmd.exe newline/quoting issues with large args):
+ *  - System prompt → written to a temp file, loaded with --append-system-prompt-file
+ *  - User content  → piped to the process stdin; Claude reads it as context
+ *  - A short fixed -p instruction triggers non-interactive mode
+ *
+ * On Windows, .cmd wrappers must run through cmd.exe /c (no shell: true needed
+ * since we're explicitly invoking cmd.exe with an args array).
+ *
+ * Returns parsed JSON extracted from the response text, or throws on failure.
  */
 async function callLLM(systemPrompt, userContent) {
-  const baseURL = process.env.OPENAI_BASE_URL || process.env.LITELLM_BASE_URL;
-  const apiKey = process.env.OPENAI_API_KEY || (baseURL ? "sk-litellm-local" : null);
-  if (!apiKey) throw new Error("No LLM API key configured");
+  const model = process.env.BEDROCK_MODEL ?? "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
+  const env = { ...process.env, CLAUDE_CODE_USE_BEDROCK: "1", ANTHROPIC_MODEL: model };
 
-  const { OpenAI } = await import("openai");
-  const client = new OpenAI({ apiKey, ...(baseURL ? { baseURL } : {}) });
+  // Write system prompt to a temp file — avoids newline / shell-escape problems
+  const sysTmp = path.join(tmpdir(), `claude-sys-${Date.now()}.txt`);
+  await writeFile(sysTmp, systemPrompt, "utf8");
 
-  const res = await client.chat.completions.create({
-    model: process.env.OPENAI_MODEL ?? "gpt-4o-mini",
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userContent },
-    ],
-  });
+  try {
+    const claudeArgs = [
+      "--bare",
+      "--append-system-prompt-file", sysTmp,
+      "--output-format", "text",
+      "-p", "Analyze the piped input and return the JSON object as your system prompt instructs.",
+    ];
 
-  const text = res.choices?.[0]?.message?.content ?? "";
-  const raw = extractJsonObject(text);
-  if (!raw) throw new Error(`LLM did not return JSON: ${text.slice(0, 300)}`);
-  return JSON.parse(raw);
+    // On Windows invoke via cmd.exe /c so the .cmd wrapper is resolved
+    const [cmd, spawnArgs] = process.platform === "win32"
+      ? ["cmd.exe", ["/c", "claude.cmd", ...claudeArgs]]
+      : ["claude", claudeArgs];
+
+    const stdout = await new Promise((resolve, reject) => {
+      const proc = spawn(cmd, spawnArgs, { env, stdio: ["pipe", "pipe", "pipe"] });
+
+      // Pipe user content (code, logs, incident details) as stdin context
+      proc.stdin.write(userContent, "utf8");
+      proc.stdin.end();
+
+      let out = "";
+      let err = "";
+      proc.stdout.on("data", (d) => { out += d.toString(); });
+      proc.stderr.on("data", (d) => { err += d.toString(); });
+      proc.on("close", (code) => {
+        if (code !== 0) reject(new Error(`Claude CLI exited ${code}: ${err.slice(0, 400)}`));
+        else resolve(out);
+      });
+      proc.on("error", reject);
+    });
+
+    const raw = extractJsonObject(stdout);
+    if (!raw) throw new Error(`Claude CLI did not return JSON: ${stdout.slice(0, 300)}`);
+    return JSON.parse(raw);
+  } finally {
+    await unlink(sysTmp).catch(() => {});
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -120,39 +155,20 @@ function triageFallback(prompt) {
 }
 
 async function triageWithLLM(prompt) {
-  const baseURL = process.env.OPENAI_BASE_URL || process.env.LITELLM_BASE_URL;
-  const apiKey = process.env.OPENAI_API_KEY || (baseURL ? "sk-litellm-local" : null);
-  if (!apiKey) return null;
-
   try {
-    const { OpenAI } = await import("openai");
-    const client = new OpenAI({ apiKey, ...(baseURL ? { baseURL } : {}) });
+    const systemPrompt = [
+      "You triage production incident requests for a ServiceNow integration.",
+      "Given the user's free-text message, return a JSON object with EXACTLY these fields:",
+      '  - identifier: string|null. The issue identifier mentioned (e.g. "TEST-001"). null if none.',
+      "  - shortDescription: string, <=100 chars, no markdown, suitable for ServiceNow short_description.",
+      "  - description: string, 1-4 sentences elaborating the request.",
+      '  - urgency: "1" (high) | "2" (medium) | "3" (low). Default "2".',
+      '  - impact:  "1" (high) | "2" (medium) | "3" (low). Default "2".',
+      '  - category: "software" | "hardware" | "network" | "inquiry". Default "network".',
+      "Return ONLY the JSON object, no prose, no markdown fences.",
+    ].join("\n");
 
-    const res = await client.chat.completions.create({
-      model: process.env.OPENAI_MODEL ?? "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content: [
-            "You triage production incident requests for a ServiceNow integration.",
-            "Given the user's free-text message, return a JSON object with EXACTLY these fields:",
-            '  - identifier: string|null. The issue identifier mentioned (e.g. "TEST-001"). null if none.',
-            "  - shortDescription: string, <=100 chars, no markdown, suitable for ServiceNow short_description.",
-            "  - description: string, 1-4 sentences elaborating the request.",
-            '  - urgency: "1" (high) | "2" (medium) | "3" (low). Default "2".',
-            '  - impact:  "1" (high) | "2" (medium) | "3" (low). Default "2".',
-            '  - category: "software" | "hardware" | "network" | "inquiry". Default "network".',
-            "Return ONLY the JSON object, no prose, no markdown fences.",
-          ].join("\n"),
-        },
-        { role: "user", content: prompt },
-      ],
-    });
-
-    const text = res.choices?.[0]?.message?.content ?? "";
-    const json = extractJsonObject(text);
-    if (!json) throw new Error(`LLM did not return JSON: ${text.slice(0, 200)}`);
-    const parsed = JSON.parse(json);
+    const parsed = await callLLM(systemPrompt, prompt);
 
     return {
       identifier:
@@ -166,7 +182,7 @@ async function triageWithLLM(prompt) {
       category: ALLOWED_CATEGORIES.has(String(parsed.category)) ? String(parsed.category) : "network",
     };
   } catch (err) {
-    console.warn("[agent] LLM triage failed, falling back to regex:", err?.message ?? err);
+    console.warn("[agent] Claude CLI triage failed, falling back to regex:", err?.message ?? err);
     return null;
   }
 }

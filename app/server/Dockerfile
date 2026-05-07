@@ -13,6 +13,10 @@ ENV LOG_PATH=/app/logs/server.jsonl
 
 ENV SERVER_PORT=3001
 
+# Claude CLI — available for docker exec–based code analysis tasks.
+# Credentials injected at runtime via CLAUDE_CODE_USE_BEDROCK + AWS_* env vars.
+RUN npm install -g @anthropic-ai/claude-code
+
 EXPOSE 3001
 VOLUME ["/app/logs"]
 
